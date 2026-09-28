@@ -431,6 +431,7 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 	struct en75_tx_doneq *done_q;
 	struct en75_qdma *qdma;
 	int id, irq_queued;
+	struct net_device *wake_dev = NULL;
 	u32 done = 0, head;
 
 	done_q = container_of(napi, struct en75_tx_doneq, napi);
@@ -497,8 +498,7 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 		txq = netdev_get_tx_queue(skb->dev,
 					  skb_get_queue_mapping(skb));
 		netdev_tx_completed_queue(txq, 1, skb->len);
-		if (netif_tx_queue_stopped(txq))
-			netif_tx_wake_queue(txq);
+		wake_dev = skb->dev;
 
 		dev_kfree_skb_any(skb);
 	}
@@ -513,6 +513,14 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 		en75_rreg(&qdma->regs->done_queue.pop_back);
 		en75_wreg(done & 0x7f, &qdma->regs->done_queue.pop_back);
 	}
+
+	/* The hardware TX ring is shared by all soft queues, but waking only
+	 * the queue a completed skb came from leaves every other queue that
+	 * was stopped on ring-full stopped forever: no completion ever maps
+	 * to it, so the flows hashed there stall permanently. Wake them all;
+	 * en75_dev_xmit re-stops queues while the ring is still full. */
+	if (wake_dev)
+		netif_tx_wake_all_queues(wake_dev);
 
 	if (done < budget && napi_complete(napi)) {
 		union en75_irq_purpose purpose = IRQ_PURPOSE(DONE, TX, id);
