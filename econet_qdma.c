@@ -952,6 +952,13 @@ static int en75_init_final(struct en75_qdma *qdma)
 	en75_wreg(0U, &qdma->regs->tx_int_delay);
 	en75_wreg(0U, &qdma->regs->rx_int_delay);
 
+	/* The bootloader leaves the "CPU protection" rate limiter on
+	 * (0x2000007D: ~125 Mbit/s, charged per max-size frame
+	 * regardless of actual packet length), which caps all
+	 * QDMA-to-CPU RX. Disabling it took host-terminated RX from
+	 * 131 to 151+ Mbit/s on EN751221 (TP-Link Archer C5v). */
+	en75_wreg(0U, &qdma->regs->cpu_rx_limit);
+
 	struct qregs_tx_congest_cfg cngst_cfg = {0};
 	set_qregs_tx_congest_cfg_tail_drop_en(&cngst_cfg, true);
 	set_qregs_tx_congest_cfg_dei_drop_en(&cngst_cfg, true);
