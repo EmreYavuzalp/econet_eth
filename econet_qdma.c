@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/spinlock.h>
+#include <linux/hrtimer.h>
 #include <linux/netdevice.h>
 #include <net/page_pool/helpers.h>
 #include <linux/skbuff.h>
@@ -59,6 +60,9 @@ struct en75_q_tx {
 	u16				freelist_head;
 	u16				freelist_tail;
 
+	/* Packets submitted but not yet completed. */
+	atomic_t			inflight;
+
 	/* Not modified after init */
 	struct en75_qdma		*qdma;
 	struct qchain_regs __iomem	*qchain_regs;
@@ -84,6 +88,9 @@ struct en75_tx_doneq {
 	/* No lock, access only in NAPI */
 	u32 				*q;
 	struct qregs_doneq __iomem	*regs;
+
+	/* Self-armed completion poll timer, see en75_tx_done_kick() */
+	struct hrtimer			kick;
 
 	/* Not modified after init */
 	struct en75_qdma 		*qdma;
@@ -425,6 +432,35 @@ static irqreturn_t en75_irq_handler(int irq_num, void *dev_instance)
 #define IRQ_RING_IDX_MASK		GENMASK(20, 16)
 #define IRQ_DESC_IDX_MASK		GENMASK(15, 0)
 
+/* TX-done completions do not reliably raise an interrupt: the
+ * done-queue IRQ only fires on the empty -> non-empty transition, and
+ * in practice not even that arrives promptly. Completions were only
+ * processed when an unrelated interrupt (usually the timer tick) ran
+ * the handler, which capped TX at roughly ring_size packets per jiffy
+ * (~11 kpps / ~120 Mbit/s at 1400 bytes) with the CPU >90% idle.
+ * Instead of relying on the hardware, poll for completions shortly
+ * after every submission and keep polling while anything is in
+ * flight. */
+#define EN75_TX_DONE_KICK_NS	150000
+
+static enum hrtimer_restart en75_tx_done_kick(struct hrtimer *t)
+{
+	struct en75_tx_doneq *done_q =
+		container_of(t, struct en75_tx_doneq, kick);
+
+	napi_schedule(&done_q->napi);
+
+	return HRTIMER_NORESTART;
+}
+
+static void en75_tx_done_kick_arm(struct en75_tx_doneq *done_q)
+{
+	if (!hrtimer_is_queued(&done_q->kick))
+		hrtimer_start(&done_q->kick,
+			      ns_to_ktime(EN75_TX_DONE_KICK_NS),
+			      HRTIMER_MODE_REL);
+}
+
 static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 {
 	struct qregs_doneq_state state;
@@ -495,6 +531,8 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 		q->entry[q->freelist_tail].freelist_next = index;
 		q->freelist_tail = index;
 
+		atomic_dec(&q->inflight);
+
 		txq = netdev_get_tx_queue(skb->dev,
 					  skb_get_queue_mapping(skb));
 		netdev_tx_completed_queue(txq, 1, skb->len);
@@ -539,6 +577,19 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 		state = en75_rreg(&done_q->regs->state);
 		if (get_qregs_doneq_state_length(&state) > 0)
 			napi_schedule(napi);
+	}
+
+	/* Completions of in-flight packets will not interrupt us; keep
+	 * the poll timer running until everything has completed. */
+	{
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+			if (atomic_read(&qdma->q_tx[i].inflight) > 0) {
+				en75_tx_done_kick_arm(done_q);
+				break;
+			}
+		}
 	}
 
 	return done;
@@ -588,6 +639,9 @@ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
 	skb_tx_timestamp(skb);
 
 	en75_wreg((u32)next_index, &q->qchain_regs->tx_cpui);
+
+	atomic_inc(&q->inflight);
+	en75_tx_done_kick_arm(&qdma->q_tx_done[0]);
 
 	if (q->debug_tx_cnt) {
 		int chq;
@@ -726,6 +780,8 @@ static int en75_init_tx_doneq(struct en75_tx_doneq *done_q,
 {
 	dma_addr_t dma_addr;
 
+	hrtimer_setup(&done_q->kick, en75_tx_done_kick,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	netif_napi_add_tx(qdma->napi_dev, &done_q->napi,
 			  en75_poll_tx_complete);
 	done_q->q = dmam_alloc_coherent(qdma->dev, size * sizeof(u32),
@@ -761,6 +817,7 @@ static int en75_init_tx_queue(struct en75_q_tx *q,
 
 	spin_lock_init(&q->lock_bh);
 	q->ndesc = size;
+	atomic_set(&q->inflight, 0);
 	q->qdma = qdma;
 	q->qchain_regs = (qid == 0) ?
 			 &qdma->regs->qchain0 :
@@ -1053,8 +1110,10 @@ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++) {
 		struct en75_tx_doneq *q = &qdma->q_tx_done[i];
 
-		if (q->napi.dev)
+		if (q->napi.dev) {
+			hrtimer_cancel(&q->kick);
 			netif_napi_del(&q->napi);
+		}
 	}
 
 	if (qdma->napi_dev)
@@ -1114,8 +1173,10 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++)
 		napi_disable(&qdma->q_rx[i].napi);
 
-	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++)
+	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++) {
+		hrtimer_cancel(&qdma->q_tx_done[i].kick);
 		napi_disable(&qdma->q_tx_done[i].napi);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
 		struct en75_q_tx *q = &qdma->q_tx[i];
@@ -1137,6 +1198,7 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
 			q->entry[q->freelist_tail].freelist_next = j;
 			q->freelist_tail = j;
 		}
+		atomic_set(&q->inflight, 0);
 	}
 
 	if (qdma->destroying)
