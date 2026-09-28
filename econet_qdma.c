@@ -527,6 +527,18 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 		union irq_bit b = en751221_irq_bit(purpose);
 
 		en75_qdma_set_irqmask(qdma, b, true);
+
+		/* The done-queue interrupt only fires on the empty ->
+		 * non-empty transition. Completions that arrive while we
+		 * are polling leave the queue non-empty, so no further
+		 * interrupt ever comes and they sit unprocessed until an
+		 * unrelated interrupt runs the handler -- in practice the
+		 * timer tick, so TX-done arrives in 10 ms batches and
+		 * throughput is capped at ring_size/jiffy. Re-check after
+		 * unmasking and keep polling if there is still work. */
+		state = en75_rreg(&done_q->regs->state);
+		if (get_qregs_doneq_state_length(&state) > 0)
+			napi_schedule(napi);
 	}
 
 	return done;
@@ -731,6 +743,12 @@ static int en75_init_tx_doneq(struct en75_tx_doneq *done_q,
 	set_qregs_doneq_cfg_size(&cfg, size);
 	set_qregs_doneq_cfg_int_threshold(&cfg, 1);
 	en75_wreg(cfg, &qdma->regs->done_queue.config);
+
+	/* Interrupt as soon as anything is in the done queue: this wait
+	 * time directly bounds TX completion latency (live test on
+	 * EN751221: 0x20 -> 1 took single-flow UDP TX from 92 to
+	 * 124 Mbit/s). Unit is ~20 us. */
+	en75_wreg(1U, &qdma->regs->done_queue.wait_time);
 
 	return 0;
 }
