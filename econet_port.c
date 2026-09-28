@@ -209,6 +209,17 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
 
+	if (ret == -EBUSY) {
+		/* The TX ring is full. Undo the BQL accounting and ask the
+		 * qdisc to requeue this skb later. We must NOT free it here:
+		 * NETDEV_TX_BUSY means we did not take ownership of the skb,
+		 * so freeing it causes a use-after-free once the qdisc retries
+		 * (seen as crashes in __qdisc_run / skb refcount underflow). */
+		netdev_tx_completed_queue(txq, 1, len);
+		netif_tx_stop_queue(txq);
+		return NETDEV_TX_BUSY;
+	}
+
 	if (ret < 0) {
 		netdev_tx_completed_queue(txq, 1, len);
 		goto error;
@@ -222,11 +233,6 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 error:
 	dev_kfree_skb_any(skb);
 	dev->stats.tx_dropped++;
-
-	if (ret == -EBUSY) {
-		netif_tx_stop_queue(txq);
-		return NETDEV_TX_BUSY;
-	}
 
 	return NETDEV_TX_OK;
 }
