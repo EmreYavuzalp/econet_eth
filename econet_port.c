@@ -145,6 +145,20 @@ static int en75_dev_open(struct net_device *dev)
 
 	netif_tx_start_all_queues(dev);
 
+	/* TX-done completions are reported with ~3 ms latency. BQL reacts
+	 * by clamping each queue's limit to a single packet, serializing
+	 * TX to one packet per completion round-trip (~314 pps). Keep the
+	 * per-queue floor above the TX ring capacity so the ring stays
+	 * full; this takes TX from ~3.6 Mbit/s to ~92 Mbit/s. */
+#ifdef CONFIG_BQL
+	{
+		unsigned int i;
+
+		for (i = 0; i < dev->num_tx_queues; i++)
+			netdev_get_tx_queue(dev, i)->dql.min_limit = 200000;
+	}
+#endif
+
 	// TODO DSA
 	// if (netdev_uses_dsa(dev))
 	// 	airoha_fe_set(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
