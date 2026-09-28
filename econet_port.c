@@ -219,6 +219,17 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (skb_linearize(skb))
 		goto error;
 
+	/* QDMA/GDM does not reliably pad runt frames. A default PPPoE PADI
+	 * over VLAN35 is shorter than ETH_ZLEN and is visible on the local
+	 * netdev but not on the wire unless it is padded here. eth_skb_pad()
+	 * frees the skb on error, so do not fall through to the common error
+	 * path in that case. */
+	if (eth_skb_pad(skb)) {
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+	len = skb->len;
+
 	netdev_tx_sent_queue(txq, len);
 
 	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
