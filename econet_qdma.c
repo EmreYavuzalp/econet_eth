@@ -923,6 +923,7 @@ static int en75_init_final(struct en75_qdma *qdma)
 	set_qregs_qcfg_burst_size(&qcfg, QREGS_QCFG_BURST_SIZE_128_BYTES);
 	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
 
+	en75_wreg(0U, &qdma->regs->tx_int_delay);
 	en75_wreg(0U, &qdma->regs->rx_int_delay);
 
 	struct qregs_tx_congest_cfg cngst_cfg = {0};
