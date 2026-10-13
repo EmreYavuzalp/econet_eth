@@ -235,6 +235,16 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	set_etx_queue(&msg.etx, qid % EN75_NUM_QUEUES);
 	set_etx_fport(&msg.etx, port->fport);
 
+	/* The QDMA generates the IP/TCP/UDP checksums on demand (the ICO/
+	 * UCO/TCO enables in the TX message). Setting all three is safe:
+	 * the hardware only applies the ones matching the parsed packet,
+	 * the same convention mtk_eth_soc uses for TX_DMA_CHKSUM. */
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		set_etx_ico(&msg.etx, true);
+		set_etx_uco(&msg.etx, true);
+		set_etx_tco(&msg.etx, true);
+	}
+
 	txq = netdev_get_tx_queue(dev, qid);
 
 	/* Non-linear skbs are unsupported, we shouldn't get them but
@@ -475,14 +485,16 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
 	 * NETIF_F_TSO | NETIF_F_TSO6:
 	 *   - Supported in EN751627, not in EN751221, not used in forwarding.
 	 *
-	 * NETIF_F_IP_CSUM | NETIF_F_RXCSUM | NETIF_F_IPV6_CSUM:
-	 *   - Supported but disabled for simplicity.
+	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM:
+	 *   - TX checksum generation via the ICO/UCO/TCO enables in the TX
+	 *     message. Matters for the CPU path (Wi-Fi forwarding, tunnels,
+	 *     locally originated traffic); the PPE path never sees the CPU.
 	 *
 	 * NETIF_F_HW_TC:
 	 *   - TODO: When we get the PPE working, we will enable this for
 	 *           TC_SETUP_BLOCK / TC_SETUP_FT for NAT flow-table offloading.
 	 */
-	ndev->hw_features = 0;
+	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 
 	ndev->features |= ndev->hw_features;
 	ndev->vlan_features = ndev->hw_features;
