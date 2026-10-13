@@ -212,46 +212,32 @@ en75_flow_tuple_from_skb(struct en75_flow_tuple *t, struct sk_buff *skb)
 /*
  * Apply one eth-header rewrite action into the 14-byte L2 scratch buffer.
  *
- * nf_flow_table_offload encodes the new MACs as fixed actions whose value/
- * mask are host u32s laid out for a LITTLE-ENDIAN CPU. On LE the upstream mtk
- * byte-copy reproduces that directly; on big-endian the two 2-byte halves
- * (dst MAC[4:6] and src MAC[0:2]) come out zero, so there decode each action
- * by its mask and place the correct native bytes explicitly.
+ * nf_flow_table_offload encodes the new MAC addresses as four fixed actions
+ * whose value/mask are host u32s laid out for a LITTLE-ENDIAN CPU (e.g. for
+ * dst[4:6] it does `val = val16; mask = ~0x0000ffff`). The upstream mtk
+ * byte-copy only reproduces that on LE; on this big-endian MIPS the two
+ * 2-byte halves (dst MAC[4:6] and src MAC[0:2]) came out zero, leaving a bogus
+ * next-hop MAC so bound flows never forwarded. Decode each action by its mask
+ * and place the correct native bytes explicitly. (BE target only: this driver
+ * is EN751221-specific, always big-endian.)
  */
 static void
 en75_flow_offload_mangle_eth(const struct flow_action_entry *act, void *eth)
 {
-	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN)) {
-		const u8 *vb = (const u8 *)&act->mangle.val;	/* native (BE) bytes */
-		u8 *e = (u8 *)eth;
+	const u8 *vb = (const u8 *)&act->mangle.val;	/* native (BE) bytes */
+	u8 *e = (u8 *)eth;
 
-		switch (act->mangle.mask) {
-		case 0x00000000:	/* dst[0:4] (off 0) or src[2:6] (off 8) */
-			if (act->mangle.offset <= 8)
-				memcpy(e + act->mangle.offset, vb, 4);
-			break;
-		case 0xffff0000:	/* dst MAC[4:6] -> eth[4:6] */
-			memcpy(e + 4, vb + 2, 2);
-			break;
-		case 0x0000ffff:	/* src MAC[0:2] -> eth[6:8] */
-			memcpy(e + 6, vb, 2);
-			break;
-		default:
-			break;
-		}
-	} else {
-		void *dest = eth + act->mangle.offset;
-		const void *src = &act->mangle.val;
-
-		if (act->mangle.offset > 8)
-			return;
-
-		if (act->mangle.mask == 0xffff) {
-			src += 2;
-			dest += 2;
-		}
-
-		memcpy(dest, src, act->mangle.mask ? 2 : 4);
+	switch (act->mangle.mask) {
+	case 0x00000000:		/* full word: dst[0:4] (off 0) or src[2:6] (off 8) */
+		if (act->mangle.offset <= 8)
+			memcpy(e + act->mangle.offset, vb, 4);
+		break;
+	case 0xffff0000:		/* dst MAC[4:6] -> eth[4:6] */
+		memcpy(e + 4, vb + 2, 2);
+		break;
+	case 0x0000ffff:		/* src MAC[0:2] -> eth[6:8] */
+		memcpy(e + 6, vb, 2);
+		break;
 	}
 }
 
