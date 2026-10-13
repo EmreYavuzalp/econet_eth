@@ -131,6 +131,7 @@
 #define MT7530_PPBV1_P(x)		(0x2014 + ((x) * 0x100))
 #define  G0_PORT_VID(x)		(((x) & 0xfff) << 0)
 #define  G0_PORT_VID_MASK		G0_PORT_VID(0xfff)
+#define EN75_MT7530_PVC_DEFAULT	0x81000000
 
 enum en75_mt7530_vlan_cmd {
 	MT7530_VTCR_WR_VID = 1,
@@ -430,6 +431,54 @@ static int en75_ext_switch_set_port(struct en75_eth_pvt *eth, int port,
 				     G0_PORT_VID_MASK, G0_PORT_VID(pvid));
 }
 
+static int en75_ext_switch_write_port_compat(struct en75_eth_pvt *eth,
+						   const u32 *lan_ports, int lan_count,
+						   u32 cpu_port, u32 wan_port,
+						   u16 lan_vid, u16 wan_untagged_vid)
+{
+	int i, err;
+
+	for (i = 0; i < lan_count; i++) {
+		err = en75_ext_switch_write(eth, MT7530_PCR_P(lan_ports[i]),
+					    PCR_MATRIX(0xff) | MT7530_PORT_SECURITY_MODE);
+		if (err)
+			return err;
+
+		err = en75_ext_switch_write(eth, MT7530_PPBV1_P(lan_ports[i]),
+					    G0_PORT_VID(lan_vid));
+		if (err)
+			return err;
+
+		err = en75_ext_switch_write(eth, MT7530_PVC_P(lan_ports[i]),
+					    EN75_MT7530_PVC_DEFAULT);
+		if (err)
+			return err;
+	}
+
+	err = en75_ext_switch_write(eth, MT7530_PCR_P(wan_port),
+					PCR_MATRIX(0xff) | MT7530_PORT_SECURITY_MODE);
+	if (err)
+		return err;
+
+	err = en75_ext_switch_write(eth, MT7530_PPBV1_P(wan_port),
+					G0_PORT_VID(wan_untagged_vid));
+	if (err)
+		return err;
+
+	err = en75_ext_switch_write(eth, MT7530_PVC_P(wan_port),
+					EN75_MT7530_PVC_DEFAULT);
+	if (err)
+		return err;
+
+	err = en75_ext_switch_write(eth, MT7530_PCR_P(cpu_port),
+					PCR_MATRIX(0xff) | MT7530_PORT_SECURITY_MODE);
+	if (err)
+		return err;
+
+	return en75_ext_switch_write(eth, MT7530_PVC_P(cpu_port),
+				       EN75_MT7530_PVC_DEFAULT);
+}
+
 static int en75_ext_switch_configure_vlan_split(struct en75_eth_pvt *eth)
 {
 	struct device_node *np = eth->pub.dev->of_node;
@@ -575,6 +624,12 @@ static int en75_ext_switch_configure_vlan_split(struct en75_eth_pvt *eth)
 		if (err)
 			return err;
 	}
+
+	err = en75_ext_switch_write_port_compat(eth, lan_ports, lan_count,
+					       cpu_port, wan_port, lan_vid,
+					       wan_untagged_vid);
+	if (err)
+		return err;
 
 	dev_info(eth->pub.dev,
 		 "configured external MT7530 VLAN split: lan vid %u ports 0x%x, wan untagged vid %u, wan tagged vid %u port %u, cpu port %u%s\n",
