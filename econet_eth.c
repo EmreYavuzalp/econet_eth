@@ -36,6 +36,7 @@
 #include <net/dsa.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/delay.h>
 #include <linux/of_net.h>
 #include <linux/iopoll.h>
 #include <linux/workqueue.h>
@@ -345,6 +346,117 @@ static int en75_ext_switch_rmw(struct en75_eth_pvt *eth, u32 reg, u32 mask,
 		return err;
 
 	return en75_ext_switch_write(eth, reg, (orig & ~mask) | val);
+}
+
+/*
+ * Re-synchronise the TRGMII link between the SoC GSW (port 5) and the external
+ * MT7530 (port 6). Some Archer C5v boots end up with correct MT7530 registers
+ * but no RX traffic crossing the CPU/TRGMII path. This mirrors the vendor SDK
+ * pad-resync sequence from trgmii_interface_init(), while deliberately leaving
+ * PLL/clock setup alone because the bootloader already brought it up.
+ */
+#define EN75_TRGMII_PMCR_DOWN \
+	((u32)(EN75_PMCR_CONFIG & ~(PMCR_FORCE_LNK | PMCR_MAC_TX_EN)))
+
+static int en75_trgmii_resync(struct en75_eth_pvt *eth)
+{
+	static const u16 odt_regs[] = { 0x7a54, 0x7a5c, 0x7a64, 0x7a6c, 0x7a74 };
+	u32 reg;
+	int i;
+	int err;
+
+	/* MT7530 7-second auto-powerdown workaround (CKGCR). */
+	err = en75_ext_switch_write(eth, 0x30f0, 0x00001e02);
+	if (err)
+		return err;
+
+	/* Enable TRGMII on both endpoints. */
+	err = en75_ext_switch_write(eth, 0x7808, 0);
+	if (err)
+		return err;
+	err = en75_ext_switch_write(eth, 0x7804, 0x01017e8f);
+	if (err)
+		return err;
+	err = en75_ext_switch_write(eth, 0x7808, 1);
+	if (err)
+		return err;
+
+	en75_gsw_write(eth, 0x7808, 0);
+	en75_gsw_write(eth, 0x7804, 0x01017e8f);
+	en75_gsw_write(eth, 0x7808, 1);
+
+	/* Force both CPU-port links down while the pads are reset. */
+	en75_gsw_write(eth, MT753X_PMCR_P(5), EN75_TRGMII_PMCR_DOWN);
+	err = en75_ext_switch_write(eth, MT753X_PMCR_P(6), EN75_TRGMII_PMCR_DOWN);
+	if (err)
+		return err;
+	mdelay(5);
+
+	/* Reset TRGMII Tx/Rx (TXCTRL 0x7a40 bit 28). */
+	err = en75_ext_switch_read(eth, 0x7a40, &reg);
+	if (err)
+		return err;
+	err = en75_ext_switch_write(eth, 0x7a40, reg | BIT(28));
+	if (err)
+		return err;
+	mdelay(5);
+	err = en75_ext_switch_write(eth, 0x7a40, reg & ~BIT(28));
+	if (err)
+		return err;
+
+	reg = en75_gsw_read(eth, 0x7a40);
+	en75_gsw_write(eth, 0x7a40, reg | BIT(28));
+	mdelay(5);
+	en75_gsw_write(eth, 0x7a40, reg & ~BIT(28));
+
+	/* Enter calibration (RCK_CTRL 0x7a00 bit 31). */
+	err = en75_ext_switch_read(eth, 0x7a00, &reg);
+	if (err)
+		return err;
+	err = en75_ext_switch_write(eth, 0x7a00, reg | BIT(31));
+	if (err)
+		return err;
+	reg = en75_gsw_read(eth, 0x7a00);
+	en75_gsw_write(eth, 0x7a00, reg | BIT(31));
+
+	/* Tx driving strength / ODT board values from the vendor SDK. */
+	for (i = 0; i < ARRAY_SIZE(odt_regs); i++) {
+		err = en75_ext_switch_write(eth, odt_regs[i], 0xaa);
+		if (err)
+			return err;
+		en75_gsw_write(eth, odt_regs[i], 0xaa);
+	}
+	err = en75_ext_switch_write(eth, 0x7a7c, 0x77);
+	if (err)
+		return err;
+	en75_gsw_write(eth, 0x7a7c, 0x77);
+
+	/* Enable the TRGMII port. */
+	err = en75_ext_switch_write(eth, 0x7830, 1);
+	if (err)
+		return err;
+	en75_gsw_write(eth, 0x7830, 1);
+	mdelay(5);
+
+	/* Leave calibration. */
+	err = en75_ext_switch_read(eth, 0x7a00, &reg);
+	if (err)
+		return err;
+	err = en75_ext_switch_write(eth, 0x7a00, reg & ~BIT(31));
+	if (err)
+		return err;
+	reg = en75_gsw_read(eth, 0x7a00);
+	en75_gsw_write(eth, 0x7a00, reg & ~BIT(31));
+
+	/* Bring both CPU-port links back up with TX/RX enabled. */
+	en75_gsw_write(eth, MT753X_PMCR_P(5), EN75_PMCR_CONFIG);
+	err = en75_ext_switch_write(eth, MT753X_PMCR_P(6), EN75_PMCR_CONFIG);
+	if (err)
+		return err;
+
+	dev_info(eth->pub.dev, "re-synced MT7530 TRGMII path\n");
+
+	return 0;
 }
 
 static int en75_ext_switch_vlan_cmd(struct en75_eth_pvt *eth, u16 vid)
@@ -973,6 +1085,14 @@ static int en75_probe(struct platform_device *pdev)
 		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
 		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
 		en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
+
+		if (of_property_read_bool(pdev->dev.of_node, "econet,mt7530-vlan-split")) {
+			err = en75_trgmii_resync(eth);
+			if (err)
+				dev_warn(&pdev->dev,
+					 "failed to re-sync MT7530 TRGMII path: %d\n",
+					 err);
+		}
 
 		err = en75_ext_switch_configure_vlan_split(eth);
 		if (err)
