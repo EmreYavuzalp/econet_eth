@@ -21,18 +21,23 @@
 #include <linux/if_ether.h>
 #include <linux/in.h>
 
+#include "econet_eth.h"
 #include "econet_ppe.h"
 
 #define EN75_PPE_WAIT_TIMEOUT_US	1000000
 
+/* en75_rreg()/en75_wreg() (econet_eth.h) are the one place in the driver
+ * that knows how to do a plain 32-bit MMIO access; reuse them here instead
+ * of a second, PPE-local readl/writel wrapper.
+ */
 static inline u32 ppe_r32(struct en75_ppe *ppe, u32 reg)
 {
-	return readl(ppe->base + reg);
+	return en75_rreg((u32 __iomem *)(ppe->base + reg));
 }
 
 static inline void ppe_w32(struct en75_ppe *ppe, u32 reg, u32 val)
 {
-	writel(val, ppe->base + reg);
+	en75_wreg(val, (u32 __iomem *)(ppe->base + reg));
 }
 
 static int ppe_wait_busy(struct en75_ppe *ppe)

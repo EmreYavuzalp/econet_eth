@@ -93,13 +93,8 @@ int en75_foe_entry_prepare(struct en75_foe_entry *entry, int type, int l4proto,
 	if (is_multicast_ether_addr(dest_mac))
 		val |= EN75_FOE_IB2_MULTICAST;
 
-	/* Route entries keep no L4 ports; the field is poisoned like the
-	 * vendor entry so a partial match never aliases a real port pair.
-	 * 0xa5 is an arbitrary sentinel byte (same idea as 0xdeadbeef),
-	 * repeated across all three pad bytes since only the low byte
-	 * (l4proto) is ever read back.
-	 */
-	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
+	/* Route entries keep no L4 ports; see EN75_PPE_TUPLE_PAD. */
+	ports_pad = EN75_PPE_TUPLE_PAD | (l4proto & 0xff);
 	if (type == EN75_PPE_PKT_TYPE_IPV4_ROUTE)
 		entry->ipv4.orig.ports = ports_pad;
 	if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T)
@@ -119,14 +114,15 @@ int en75_foe_entry_prepare(struct en75_foe_entry *entry, int type, int l4proto,
 	}
 
 	l2->dest_mac_hi = get_unaligned_be32(dest_mac);
-	l2->dest_mac_lo = get_unaligned_be16(dest_mac + 4);
+	l2->w1 = FIELD_PREP(EN75_MAC_INFO_DEST_MAC_LO,
+			    get_unaligned_be16(dest_mac + 4));
 	l2->src_mac_hi = get_unaligned_be32(src_mac);
-	l2->src_mac_lo = get_unaligned_be16(src_mac + 4);
+	l2->w2 = FIELD_PREP(EN75_MAC_INFO_SRC_MAC_LO,
+			    get_unaligned_be16(src_mac + 4));
 
-	if (type >= EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T)
-		l2->etype = ETH_P_IPV6;
-	else
-		l2->etype = ETH_P_IP;
+	l2->w0 = FIELD_PREP(EN75_MAC_INFO_ETYPE,
+			    type >= EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T ?
+			    ETH_P_IPV6 : ETH_P_IP);
 
 	return 0;
 }
@@ -239,14 +235,14 @@ int en75_foe_entry_set_vlan(struct en75_foe_entry *entry, int vid)
 	case 0:
 		entry->ib1 |= EN75_FOE_IB1_BIND_VLAN_TAG |
 			      FIELD_PREP(EN75_FOE_IB1_BIND_VLAN_LAYER, 1);
-		l2->vlan1 = vid;
+		l2->w0 |= FIELD_PREP(EN75_MAC_INFO_VLAN1, vid);
 		return 0;
 	case 1:
 		if (!(entry->ib1 & EN75_FOE_IB1_BIND_VLAN_TAG)) {
-			l2->vlan1 = vid;
-			l2->etype |= BIT(8);
+			l2->w0 |= FIELD_PREP(EN75_MAC_INFO_VLAN1, vid) |
+				  FIELD_PREP(EN75_MAC_INFO_ETYPE, BIT(8));
 		} else {
-			l2->vlan2 = vid;
+			l2->w1 |= FIELD_PREP(EN75_MAC_INFO_VLAN2, vid);
 			entry->ib1 += FIELD_PREP(EN75_FOE_IB1_BIND_VLAN_LAYER, 1);
 		}
 		return 0;
@@ -266,11 +262,13 @@ int en75_foe_entry_set_pppoe(struct en75_foe_entry *entry, int sid)
 	struct en75_foe_mac_info *l2 = en75_foe_entry_l2(entry);
 
 	if (!(entry->ib1 & EN75_FOE_IB1_BIND_VLAN_LAYER) ||
-	    (entry->ib1 & EN75_FOE_IB1_BIND_VLAN_TAG))
-		l2->etype = ETH_P_PPP_SES;
+	    (entry->ib1 & EN75_FOE_IB1_BIND_VLAN_TAG)) {
+		l2->w0 &= ~EN75_MAC_INFO_ETYPE;
+		l2->w0 |= FIELD_PREP(EN75_MAC_INFO_ETYPE, ETH_P_PPP_SES);
+	}
 
 	entry->ib1 |= EN75_FOE_IB1_BIND_PPPOE;
-	l2->pppoe_id = sid;
+	l2->w2 |= FIELD_PREP(EN75_MAC_INFO_PPPOE_ID, sid);
 
 	return 0;
 }

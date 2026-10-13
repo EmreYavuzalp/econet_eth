@@ -69,60 +69,49 @@ enum {
 #define EN75_FOE_IB2_PORT_AG		GENMASK(23, 18)
 #define EN75_FOE_IB2_DSCP		GENMASK(31, 24)
 
-/* Shared L2 trailer: rewritten MAC/VLAN/PPPoE header for the bound flow. */
-/*
- * __en75_ppe_foe_commit() byte-swaps each 32-bit word (cpu_to_le32). On a
- * big-endian host that swaps the two u16 halves of every two-u16 word, so
- * those pairs are declared reversed to land right in the LE table; on a
- * little-endian host cpu_to_le32 is a no-op and the natural order is correct.
+/* Shared L2 trailer: rewritten MAC/VLAN/PPPoE header for the bound flow.
+ *
+ * Each two-u16 wire pair (vlan/etype, vlan/mac-lo, pppoe/mac-lo) is kept as
+ * one plain u32 word with GENMASK/FIELD_PREP accessors instead of two named
+ * u16 struct members. That makes the layout host-endian-agnostic by
+ * construction: __en75_ppe_foe_commit() byte-swaps each 32-bit word
+ * (cpu_to_le32) on its way into the LE table, and FIELD_PREP/FIELD_GET
+ * always operate on the value, never on its in-memory byte order, so there
+ * is nothing left for a big-endian host to get wrong.
  */
+#define EN75_MAC_INFO_VLAN1		GENMASK(15, 0)
+#define EN75_MAC_INFO_ETYPE		GENMASK(31, 16)
+#define EN75_MAC_INFO_VLAN2		GENMASK(15, 0)
+#define EN75_MAC_INFO_DEST_MAC_LO	GENMASK(31, 16)
+#define EN75_MAC_INFO_PPPOE_ID		GENMASK(15, 0)
+#define EN75_MAC_INFO_SRC_MAC_LO	GENMASK(31, 16)
+
 struct en75_foe_mac_info {
-#ifdef CONFIG_CPU_BIG_ENDIAN
-	u16 etype;
-	u16 vlan1;
-#else
-	u16 vlan1;
-	u16 etype;
-#endif
-
+	u32 w0; /* EN75_MAC_INFO_VLAN1 | EN75_MAC_INFO_ETYPE */
 	u32 dest_mac_hi;
-
-#ifdef CONFIG_CPU_BIG_ENDIAN
-	u16 dest_mac_lo;
-	u16 vlan2;
-#else
-	u16 vlan2;
-	u16 dest_mac_lo;
-#endif
-
+	u32 w1; /* EN75_MAC_INFO_VLAN2 | EN75_MAC_INFO_DEST_MAC_LO */
 	u32 src_mac_hi;
-
-#ifdef CONFIG_CPU_BIG_ENDIAN
-	u16 src_mac_lo;
-	u16 pppoe_id;
-#else
-	u16 pppoe_id;
-	u16 src_mac_lo;
-#endif
+	u32 w2; /* EN75_MAC_INFO_PPPOE_ID | EN75_MAC_INFO_SRC_MAC_LO */
 };
 
 static_assert(sizeof(struct en75_foe_mac_info) == 20,
 	       "v1 FOE mac_info must be 20 bytes");
 
+/* Poison pattern for an L4-port field the hardware never reads (route
+ * entries, bridge entries): matches the vendor entry's sentinel bytes so a
+ * partial match can never alias a real port pair. The low byte is the only
+ * one ever consulted (en75_foe_entry_hash()'s l4proto use); the other three
+ * stay 0xa5 for parity with the vendor table.
+ */
+#define EN75_PPE_TUPLE_PAD	0xa5a5a500
+
 struct en75_ipv4_tuple {
 	u32 src_ip;
 	u32 dest_ip;
-	union {
-		struct {
-			u16 dest_port;
-			u16 src_port;
-		};
-		struct {
-			u8 protocol;
-			u8 _pad[3]; /* fill with 0xa5a5a5 */
-		};
-		u32 ports;
-	};
+	u32 ports; /* HNAPT/NAPT: (src_port << 16) | dest_port, host order
+		    * before __en75_ppe_foe_commit(). Route entries carry no
+		    * ports: EN75_PPE_TUPLE_PAD | l4proto instead.
+		    */
 };
 
 /* L2 bridge offload entry. */
@@ -144,9 +133,20 @@ struct en75_foe_ipv4 {
 
 	struct en75_ipv4_tuple new;
 
-	u16 timestamp;
+	/* Per-entry timestamp: AFAIK not used by this hardware (aging instead
+	 * reads ib1's own BIND_TIMESTAMP bits via en75_ppe_timestamp()); kept
+	 * reserved to match the mainline mtk_ppe v1 layout's word count.
+	 */
+	u16 _rsv_ts;
 	u16 _rsv0[3];
 
+	/* Unused by this driver; no current setter. Byte layout per upstream
+	 * review: act_dp [7:0], tsid [15:8], channel [23:16] (useful for
+	 * traffic shaping), reserved [31:24].
+	 */
+#define EN75_FOE_UDF_ACT_DP	GENMASK(7, 0)
+#define EN75_FOE_UDF_TSID	GENMASK(15, 8)
+#define EN75_FOE_UDF_CHANNEL	GENMASK(23, 16)
 	u32 udf_tsid;
 
 	struct en75_foe_mac_info l2;
@@ -157,17 +157,10 @@ struct en75_foe_ipv6 {
 	u32 src_ip[4];
 	u32 dest_ip[4];
 
-	union {
-		struct {
-			u8 protocol;
-			u8 _pad[3]; /* fill with 0xa5a5a5 */
-		}; /* 3-tuple */
-		struct {
-			u16 dest_port;
-			u16 src_port;
-		}; /* 5-tuple */
-		u32 ports;
-	};
+	u32 ports; /* 5-tuple: (src_port << 16) | dest_port, host order before
+		    * __en75_ppe_foe_commit(). 3-tuple: EN75_PPE_TUPLE_PAD |
+		    * l4proto instead (see en75_ipv4_tuple::ports).
+		    */
 
 	u32 _rsv[3];
 
