@@ -759,7 +759,7 @@ static int en75_ext_switch_configure_vlan_split(struct en75_eth_pvt *eth)
 	return 0;
 }
 
-#define EN75_MT7530_REAPPLY_MAX	3
+#define EN75_MT7530_REAPPLY_MAX	5
 
 static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
 {
@@ -768,8 +768,12 @@ static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
 		return 2000;
 	case 1:
 		return 10000;
-	default:
+	case 2:
 		return 30000;
+	case 3:
+		return 60000;
+	default:
+		return 120000;
 	}
 }
 
@@ -781,14 +785,20 @@ static void en75_ext_switch_reapply_work(struct work_struct *work)
 	unsigned int attempt = eth->mt7530_reapply_count + 1;
 	int err;
 
+	err = en75_trgmii_resync(eth);
+	if (err)
+		dev_warn(eth->pub.dev,
+			 "failed to re-sync MT7530 TRGMII path attempt %u: %d\n",
+			 attempt, err);
+
 	err = en75_ext_switch_configure_vlan_split(eth);
 	if (err)
 		dev_warn(eth->pub.dev,
-			 "failed to re-apply external MT7530 VLAN split attempt %u: %d\n",
+			 "failed to re-apply external MT7530 TRGMII/VLAN split attempt %u: %d\n",
 			 attempt, err);
 	else
 		dev_info(eth->pub.dev,
-			 "re-applied external MT7530 VLAN split attempt %u/%u\n",
+			 "re-applied external MT7530 TRGMII/VLAN split attempt %u/%u\n",
 			 attempt, EN75_MT7530_REAPPLY_MAX);
 
 	eth->mt7530_reapply_count++;
