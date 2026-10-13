@@ -846,6 +846,24 @@ static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
 	}
 }
 
+static bool en75_ext_switch_rx_seen(struct en75_eth_pvt *eth)
+{
+	struct rtnl_link_stats64 stats;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
+		if (!eth->ports[i])
+			continue;
+
+		memset(&stats, 0, sizeof(stats));
+		dev_get_stats(eth->ports[i], &stats);
+		if (stats.rx_packets)
+			return true;
+	}
+
+	return false;
+}
+
 static void en75_ext_switch_reapply_work(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
@@ -853,6 +871,13 @@ static void en75_ext_switch_reapply_work(struct work_struct *work)
 						 mt7530_reapply_work);
 	unsigned int attempt = eth->mt7530_reapply_count + 1;
 	int err;
+
+	if (en75_ext_switch_rx_seen(eth)) {
+		dev_info(eth->pub.dev,
+			 "MT7530 RX traffic seen, stopping delayed TRGMII/VLAN reapply\n");
+		eth->mt7530_reapply_count = EN75_MT7530_REAPPLY_MAX;
+		return;
+	}
 
 	err = en75_trgmii_resync(eth);
 	if (err)
