@@ -348,12 +348,67 @@ static int en75_ext_switch_rmw(struct en75_eth_pvt *eth, u32 reg, u32 mask,
 	return en75_ext_switch_write(eth, reg, (orig & ~mask) | val);
 }
 
+static int en75_mmd_write(struct en75_eth_pvt *eth, u32 phy, u32 dev,
+				  u32 reg, u16 val)
+{
+	int err;
+
+	/* Vendor mtEMiiRegWrite(): CL22 page 0 + MMD ctrl/data registers. */
+	err = en75_mdio_write16(eth, phy, 0x1f, 0x0000);
+	if (err)
+		return err;
+	err = en75_mdio_write16(eth, phy, 0x0d, dev);
+	if (err)
+		return err;
+	err = en75_mdio_write16(eth, phy, 0x0e, reg);
+	if (err)
+		return err;
+	err = en75_mdio_write16(eth, phy, 0x0d, BIT(14) | dev);
+	if (err)
+		return err;
+
+	return en75_mdio_write16(eth, phy, 0x0e, val);
+}
+
+static int en75_trgmii_setup_clock(struct en75_eth_pvt *eth, u32 phy)
+{
+	int err;
+
+	err = en75_mmd_write(eth, phy, 0x1f, 0x404, 0x1000);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x409, 0x0057);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x40a, 0x0057);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x403, 0x1800);
+	if (err)
+		return err;
+	mdelay(5);
+	err = en75_mmd_write(eth, phy, 0x1f, 0x403, 0x1c00);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x401, 0xc020);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x406, 0xa030);
+	if (err)
+		return err;
+	err = en75_mmd_write(eth, phy, 0x1f, 0x406, 0xa038);
+	if (err)
+		return err;
+
+	return en75_mmd_write(eth, phy, 0x1f, 0x410, 0x0003);
+}
+
 /*
  * Re-synchronise the TRGMII link between the SoC GSW (port 5) and the external
  * MT7530 (port 6). Some Archer C5v boots end up with correct MT7530 registers
  * but no RX traffic crossing the CPU/TRGMII path. This mirrors the vendor SDK
- * pad-resync sequence from trgmii_interface_init(), while deliberately leaving
- * PLL/clock setup alone because the bootloader already brought it up.
+ * pad-resync sequence from trgmii_interface_init(). Cold power-on also needs
+ * the vendor 200MHz MMD clock setup before the pads are reset.
  */
 #define EN75_TRGMII_PMCR_DOWN \
 	((u32)(EN75_PMCR_CONFIG & ~(PMCR_FORCE_LNK | PMCR_MAC_TX_EN)))
@@ -364,6 +419,11 @@ static int en75_trgmii_resync(struct en75_eth_pvt *eth)
 	u32 reg;
 	int i;
 	int err;
+
+	/* Vendor SDK disables external switch flow control before TRGMII setup. */
+	err = en75_ext_switch_rmw(eth, 0x1fe0, BIT(31), 0);
+	if (err)
+		return err;
 
 	/* MT7530 7-second auto-powerdown workaround (CKGCR). */
 	err = en75_ext_switch_write(eth, 0x30f0, 0x00001e02);
@@ -384,6 +444,15 @@ static int en75_trgmii_resync(struct en75_eth_pvt *eth)
 	en75_gsw_write(eth, 0x7808, 0);
 	en75_gsw_write(eth, 0x7804, 0x01017e8f);
 	en75_gsw_write(eth, 0x7808, 1);
+
+	/* Setup TRGMII 200MHz clock/PLL on both endpoints, as in vendor GPL. */
+	err = en75_trgmii_setup_clock(eth, 0);
+	if (err)
+		return err;
+	err = en75_trgmii_setup_clock(eth, 12);
+	if (err)
+		return err;
+	mdelay(50);
 
 	/* Force both CPU-port links down while the pads are reset. */
 	en75_gsw_write(eth, MT753X_PMCR_P(5), EN75_TRGMII_PMCR_DOWN);
