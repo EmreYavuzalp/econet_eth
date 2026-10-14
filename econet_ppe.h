@@ -216,6 +216,9 @@ void en75_ppe_start(struct en75_ppe *ppe);
 /** en75_ppe_stop() - disable the engine (safe to call before module unload). */
 void en75_ppe_stop(struct en75_ppe *ppe);
 
+/* econet_ppe_debug.c: econet_ppe/{foe,foe_slot,test_bind} debugfs files. */
+void en75_ppe_debugfs_init(struct en75_ppe *ppe);
+
 /**
  * en75_ppe_foe_commit() - publish a built FOE entry into the live table.
  * @hash:  table index from en75_foe_entry_hash().

@@ -238,6 +238,14 @@ en75_flow_offload_mangle_eth(const struct flow_action_entry *act, void *eth)
 	case 0x0000ffff:		/* src MAC[0:2] -> eth[6:8] */
 		memcpy(e + 6, vb, 2);
 		break;
+	default:
+		/* nf_flow_table_offload only ever emits the three masks above
+		 * for an ETH mangle; anything else means its encoding changed
+		 * underneath us, not a mask this function should silently
+		 * drop.
+		 */
+		WARN_ON_ONCE(1);
+		break;
 	}
 }
 
@@ -307,13 +315,13 @@ en75_flow_set_ipv4_addr(struct en75_foe_entry *foe, struct en75_flow_data *data,
 static int
 en75_ppe_offload_replace(struct en75_ppe *ppe, struct flow_cls_offload *f)
 {
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct en75_flow_data data = {};
 	struct en75_flow_tuple keytuple;
+	struct net_device *odev = NULL;
 	struct flow_action_entry *act;
 	struct en75_flow_entry *entry;
-	struct en75_flow_data data = {};
 	struct en75_foe_entry foe;
-	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
-	struct net_device *odev = NULL;
 	int offload_type = 0;
 	u16 addr_type = 0;
 	u8 l4proto = 0;
