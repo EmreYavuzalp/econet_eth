@@ -1235,7 +1235,11 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
 	if (!qdma->napi_dev)
 		return ERR_PTR(-ENOMEM);
 
-	qdma->napi_dev->threaded = true;
+	/* Threaded NAPI adds scheduler latency on this target; keep the
+	 * latency-sensitive QDMA RX/TX-completion path in softirq context.
+	 */
+	qdma->napi_dev->threaded = false;
+
 	snprintf(qdma->napi_dev->name, sizeof qdma->napi_dev->name, "qdma%d_eth", id);
 
 	err = en75_init(eth->dev, qdma, irqs, num_irqs);
