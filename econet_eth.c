@@ -828,6 +828,172 @@ static int en75_ext_switch_configure_vlan_split(struct en75_eth_pvt *eth)
 	return 0;
 }
 
+/*
+ * Boards with no external switch chip (e.g. TP-Link EX20v) carry the
+ * physical LAN/WAN ports directly on the SoC-internal GSW, at the same
+ * MT7530-compatible register layout as the external chip above but
+ * reachable over plain MMIO (en75_gsw_read()/en75_gsw_write()) instead of
+ * indirect MDIO. Configure it for the same kind of LAN/WAN VLAN split,
+ * gated on econet,int-gsw-vlan-split so boards without it are untouched.
+ */
+static int en75_int_switch_vlan_cmd(struct en75_eth_pvt *eth, u16 vid)
+{
+	int i;
+
+	en75_gsw_write(eth, MT7530_VTCR,
+		       VTCR_BUSY | VTCR_FUNC(MT7530_VTCR_WR_VID) | vid);
+
+	for (i = 0; i < 1000; i++) {
+		if (!(en75_gsw_read(eth, MT7530_VTCR) & VTCR_BUSY))
+			return 0;
+		udelay(10);
+	}
+
+	dev_err(eth->pub.dev, "timeout writing internal switch VLAN %u\n", vid);
+	return -ETIMEDOUT;
+}
+
+static int en75_int_switch_write_vlan(struct en75_eth_pvt *eth, u16 vid,
+				      u8 members, u8 untagged)
+{
+	u32 vawd2 = 0;
+	int port;
+
+	for (port = 0; port < EN75_MT7530_NUM_PORTS; port++) {
+		if (!(members & BIT(port)))
+			continue;
+
+		vawd2 |= ETAG_CTRL_P(port,
+				     (untagged & BIT(port)) ?
+				     MT7530_VLAN_EGRESS_UNTAG :
+				     MT7530_VLAN_EGRESS_TAG);
+	}
+
+	en75_gsw_write(eth, MT7530_VAWD1,
+		       IVL_MAC | VTAG_EN | PORT_MEM(members) |
+		       FID(FID_BRIDGED) | VLAN_VALID);
+	en75_gsw_write(eth, MT7530_VAWD2, vawd2);
+
+	return en75_int_switch_vlan_cmd(eth, vid);
+}
+
+static void en75_int_switch_set_port(struct en75_eth_pvt *eth, int port,
+				     u16 pvid)
+{
+	u32 pcr;
+
+	pcr = en75_gsw_read(eth, MT7530_PCR_P(port));
+	pcr &= ~(PCR_MATRIX_MASK | PCR_PORT_VLAN_MASK);
+	pcr |= PCR_MATRIX(0xff) | MT7530_PORT_SECURITY_MODE;
+	en75_gsw_write(eth, MT7530_PCR_P(port), pcr);
+
+	en75_gsw_write(eth, MT7530_PPBV1_P(port), G0_PORT_VID(pvid));
+	en75_gsw_write(eth, MT7530_PVC_P(port), EN75_MT7530_PVC_DEFAULT);
+}
+
+/*
+ * Invalidate a VLAN-table entry left over from a different firmware/image
+ * that used this port map differently (e.g. a prior single-image build that
+ * bridged one of these LAN ports straight to WAN for IPTV). Without this the
+ * stale entry can survive a soft reset and keep that old bridge alive.
+ */
+static int en75_int_switch_clear_vlan(struct en75_eth_pvt *eth, u16 vid)
+{
+	en75_gsw_write(eth, MT7530_VAWD1, 0);
+	en75_gsw_write(eth, MT7530_VAWD2, 0);
+
+	return en75_int_switch_vlan_cmd(eth, vid);
+}
+
+static int en75_int_switch_configure_vlan_split(struct en75_eth_pvt *eth)
+{
+	struct device_node *np = eth->pub.dev->of_node;
+	u32 lan_ports[EN75_MT7530_NUM_PORTS];
+	u32 cpu_port = 6, lan_vid = 1, wan_port, wan_vid = 35;
+	u32 wan_untagged_vid = EN75_MT7530_WAN_UNTAGGED_VID;
+	u32 stale_vid = 4096; /* >4095: "unset", nothing to clear by default */
+	u8 lan_mask = 0, wan_mask;
+	int lan_count, i, err;
+
+	if (!of_property_read_bool(np, "econet,int-gsw-vlan-split"))
+		return 0;
+
+	of_property_read_u32(np, "econet,int-gsw-cpu-port", &cpu_port);
+	of_property_read_u32(np, "econet,int-gsw-lan-vid", &lan_vid);
+	of_property_read_u32(np, "econet,int-gsw-wan-vid", &wan_vid);
+	of_property_read_u32(np, "econet,int-gsw-wan-untagged-vid",
+			     &wan_untagged_vid);
+	of_property_read_u32(np, "econet,int-gsw-stale-vid", &stale_vid);
+
+	err = of_property_read_u32(np, "econet,int-gsw-wan-port", &wan_port);
+	if (err)
+		return dev_err_probe(eth->pub.dev, err,
+				     "missing internal GSW WAN port\n");
+
+	lan_count = of_property_count_u32_elems(np, "econet,int-gsw-lan-ports");
+	if (lan_count <= 0 || lan_count > ARRAY_SIZE(lan_ports))
+		return dev_err_probe(eth->pub.dev, -EINVAL,
+				     "invalid internal GSW LAN port list\n");
+
+	err = of_property_read_u32_array(np, "econet,int-gsw-lan-ports",
+					 lan_ports, lan_count);
+	if (err)
+		return err;
+
+	if (cpu_port >= EN75_MT7530_NUM_PORTS ||
+	    wan_port >= EN75_MT7530_NUM_PORTS ||
+	    lan_vid > 4095 || wan_vid > 4095 || wan_untagged_vid > 4095 ||
+	    lan_vid == wan_vid || lan_vid == wan_untagged_vid ||
+	    wan_vid == wan_untagged_vid)
+		return dev_err_probe(eth->pub.dev, -EINVAL,
+				     "invalid internal GSW VLAN split config\n");
+
+	for (i = 0; i < lan_count; i++) {
+		if (lan_ports[i] >= EN75_MT7530_NUM_PORTS ||
+		    lan_ports[i] == cpu_port || lan_ports[i] == wan_port)
+			return dev_err_probe(eth->pub.dev, -EINVAL,
+					     "invalid internal GSW LAN port\n");
+		lan_mask |= BIT(lan_ports[i]);
+	}
+	wan_mask = BIT(wan_port);
+
+	en75_gsw_write(eth, MT753X_MFC, EN75_MFC_CONFIG);
+	en75_gsw_write(eth, MT753X_PMCR_P(cpu_port), EN75_PMCR_CONFIG);
+
+	err = en75_int_switch_write_vlan(eth, lan_vid, lan_mask | BIT(cpu_port),
+					 lan_mask);
+	if (err)
+		return err;
+
+	err = en75_int_switch_write_vlan(eth, wan_untagged_vid,
+					 wan_mask | BIT(cpu_port), wan_mask);
+	if (err)
+		return err;
+
+	err = en75_int_switch_write_vlan(eth, wan_vid, wan_mask | BIT(cpu_port),
+					 0 /* tagged on both wan_port and cpu_port */);
+	if (err)
+		return err;
+
+	/* Optional: drop one stale VLAN entry left by a different image. */
+	if (stale_vid <= 4095) {
+		err = en75_int_switch_clear_vlan(eth, stale_vid);
+		if (err)
+			return err;
+	}
+
+	for (i = 0; i < lan_count; i++)
+		en75_int_switch_set_port(eth, lan_ports[i], lan_vid);
+	en75_int_switch_set_port(eth, wan_port, wan_untagged_vid);
+	en75_int_switch_set_port(eth, cpu_port, 0);
+
+	dev_info(eth->pub.dev,
+		 "configured internal GSW VLAN split: lan vid %u ports 0x%x, wan untagged vid %u, wan tagged vid %u port %u, cpu port %u\n",
+		 lan_vid, lan_mask, wan_untagged_vid, wan_vid, wan_port, cpu_port);
+
+	return 0;
+}
+
 #define EN75_MT7530_REAPPLY_MAX	5
 
 static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
@@ -1184,8 +1350,15 @@ static int en75_probe(struct platform_device *pdev)
 
 	eth->debug = en75_debugfs_init(&debug_conf);
 
-	/* Configure the MT7530 as a dumb switch, unless it is managed by DSA */
-	if (eth->has_switch_regs) {
+	if (eth->has_switch_regs &&
+	    of_property_read_bool(pdev->dev.of_node, "econet,int-gsw-vlan-split")) {
+		/* No external switch: the physical LAN/WAN ports are on the
+		 * SoC-internal GSW itself. */
+		err = en75_int_switch_configure_vlan_split(eth);
+		if (err)
+			goto error;
+	} else if (eth->has_switch_regs) {
+		/* Configure the MT7530 as a dumb switch, unless it is managed by DSA */
 		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
 		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
 		en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
